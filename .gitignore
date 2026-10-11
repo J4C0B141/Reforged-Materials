@@ -1,0 +1,7 @@
+*.dll
+*.zip
+*.bak*
+bin/
+obj/
+PluginData/
+__pycache__/
