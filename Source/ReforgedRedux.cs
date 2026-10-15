@@ -30,6 +30,10 @@ namespace ReforgedRedux
         [KSPField(guiActive = false, guiActiveEditor = false, guiName = "Heat tiles", guiUnits = " t", guiFormat = "F3")]
         public float rdxTileMass = 0f;
 
+        public bool rdxHeatOn = false;
+        public double rdxHeatMax = 0d;
+        public double rdxHeatSkin = 0d;
+
         public float GetModuleMass(float defaultMass, ModifierStagingSituation sit) { return rdxTileMass; }
         public ModifierChangeWhen GetModuleMassChangeWhen() { return ModifierChangeWhen.FIXED; }
 
@@ -317,9 +321,11 @@ namespace ReforgedRedux
 
         static readonly HashSet<int> ourSplitIds = new HashSet<int>();
 
+        static bool IsCut(Mesh m) { return m != null && (ourSplitIds.Contains(m.GetInstanceID()) || m.name.StartsWith("RDXcut")); }
+
         Mesh OriginalMesh(Renderer r, Mesh cur)
         {
-            if (cur != null && !ourSplitIds.Contains(cur.GetInstanceID())) return cur;
+            if (cur != null && !IsCut(cur)) return cur;
             Mesh pm = PrefabMesh(r);
             return (pm != null) ? pm : cur;
         }
@@ -330,6 +336,143 @@ namespace ReforgedRedux
             SetMeshOf(r, nm);
             splitMeshes.Add(nm);
             ourSplitIds.Add(nm.GetInstanceID());
+        }
+
+        bool ResetForeignMesh(Renderer r)
+        {
+            Mesh cm = MeshOf(r);
+            bool gone = !object.ReferenceEquals(cm, null) && cm == null;
+            bool foreign = IsCut(cm) && !splitMeshes.Contains(cm);
+            if (!gone && !foreign) return false;
+            Mesh pm = PrefabMesh(r);
+            if (pm == null) return false;
+            SetMeshOf(r, pm);
+            Material[] stock = PrefabMats(r);
+            if (stock != null) r.sharedMaterials = stock;
+            return true;
+        }
+
+        void ResetForeignMeshes(List<Renderer> rs)
+        {
+            for (int i = 0; i < rs.Count; i++)
+                if (rs[i] != null && !pristine.ContainsKey(rs[i])) ResetForeignMesh(rs[i]);
+        }
+
+        void ReleaseMaterials(List<Material> prev)
+        {
+            if (prev.Count == 0) return;
+            HashSet<int> dying = new HashSet<int>();
+            for (int i = 0; i < prev.Count; i++) if (prev[i] != null) dying.Add(prev[i].GetInstanceID());
+            foreach (KeyValuePair<Renderer, Material[]> kv in pristine)
+            {
+                Renderer r = kv.Key;
+                if (r == null) continue;
+                Material[] sm = r.sharedMaterials;
+                bool stale = false;
+                for (int j = 0; j < sm.Length && !stale; j++)
+                    if (!object.ReferenceEquals(sm[j], null) && dying.Contains(sm[j].GetInstanceID())) stale = true;
+                if (!stale) continue;
+                Mesh om;
+                if (origMesh.TryGetValue(r, out om) && om != null) SetMeshOf(r, om);
+                Material[] os;
+                if (origShared.TryGetValue(r, out os) && os != null) r.sharedMaterials = os;
+            }
+            for (int i = 0; i < prev.Count; i++) if (prev[i] != null) Destroy(prev[i]);
+        }
+
+        void PadMaterials(List<Renderer> rs)
+        {
+            for (int i = 0; i < rs.Count; i++)
+            {
+                Renderer r = rs[i];
+                if (r == null) continue;
+                Mesh m = MeshOf(r);
+                if (!IsCut(m)) continue;
+                Material[] sm = r.sharedMaterials;
+                if (sm.Length == 0 || sm.Length >= m.subMeshCount) continue;
+                Material[] pad = new Material[m.subMeshCount];
+                for (int j = 0; j < pad.Length; j++) pad[j] = sm[Mathf.Min(j, sm.Length - 1)];
+                r.sharedMaterials = pad;
+            }
+        }
+
+        static int cdlState = -1;
+        static Type cdlType;
+        static FieldInfo cdlTargets, cdlRend, cdlMesh;
+
+        static bool CdlReady()
+        {
+            if (cdlState >= 0) return cdlState == 1;
+            cdlState = 0;
+            try
+            {
+                foreach (AssemblyLoader.LoadedAssembly la in AssemblyLoader.loadedAssemblies)
+                {
+                    if (la == null || la.assembly == null) continue;
+                    Type t = la.assembly.GetType("ConformalDecals.ModuleConformalDecal", false);
+                    Type pt = la.assembly.GetType("ConformalDecals.ProjectionTarget", false);
+                    if (t == null || pt == null) continue;
+                    BindingFlags bf = BindingFlags.NonPublic | BindingFlags.Instance;
+                    cdlTargets = t.GetField("_targets", bf);
+                    cdlRend = pt.GetField("_targetRenderer", bf);
+                    cdlMesh = pt.GetField("_targetMesh", bf);
+                    if (cdlTargets != null && cdlRend != null && cdlMesh != null) cdlType = t;
+                    break;
+                }
+            }
+            catch { cdlType = null; }
+            cdlState = (cdlType != null) ? 1 : 0;
+            return cdlState == 1;
+        }
+
+        Mesh FullMesh(Renderer r)
+        {
+            Mesh om;
+            if (origMesh.TryGetValue(r, out om) && om != null && !IsCut(om)) return om;
+            Mesh cm = MeshOf(r);
+            if (cm != null && !IsCut(cm)) return cm;
+            return PrefabMesh(r);
+        }
+
+        void FixDecals()
+        {
+            if (part == null || part.children == null || part.children.Count == 0 || !CdlReady()) return;
+            for (int c = 0; c < part.children.Count; c++)
+            {
+                Part ch = part.children[c];
+                if (ch == null) continue;
+                for (int k = 0; k < ch.Modules.Count; k++)
+                {
+                    PartModule pm = ch.Modules[k];
+                    if (pm == null || !cdlType.IsInstanceOfType(pm)) continue;
+                    System.Collections.IList tl = null;
+                    try { tl = cdlTargets.GetValue(pm) as System.Collections.IList; } catch { }
+                    if (tl == null) continue;
+                    for (int i = 0; i < tl.Count; i++)
+                    {
+                        object tg = tl[i];
+                        if (tg == null) continue;
+                        try
+                        {
+                            Renderer tr = cdlRend.GetValue(tg) as Renderer;
+                            if (tr == null) continue;
+                            Mesh tm = cdlMesh.GetValue(tg) as Mesh;
+                            bool gone = !object.ReferenceEquals(tm, null) && tm == null;
+                            if (!gone && !IsCut(tm)) continue;
+                            Mesh full = FullMesh(tr);
+                            if (full != null && full != tm) cdlMesh.SetValue(tg, full);
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+
+        internal static void FixAllDecals()
+        {
+            if (!CdlReady()) return;
+            foreach (ModuleReforged m in liveModules)
+                if (m != null && m.part != null && m.part.children != null && m.part.children.Count > 0) m.FixDecals();
         }
 
         void FreeSplitMeshes()
@@ -358,6 +501,78 @@ namespace ReforgedRedux
             catch { return null; }
         }
 
+        List<Renderer> JettisonRenderers()
+        {
+            List<Renderer> list = new List<Renderer>();
+            if (part == null) return list;
+            for (int i = 0; i < part.Modules.Count; i++)
+            {
+                ModuleJettison mj = part.Modules[i] as ModuleJettison;
+                if (mj == null || mj.isJettisoned) continue;
+                Transform jt = mj.jettisonTransform;
+                if (jt == null || jt.IsChildOf(part.transform)) continue;
+                Renderer[] rs = jt.GetComponentsInChildren<Renderer>(true);
+                for (int k = 0; k < rs.Length; k++)
+                    if (rs[k] != null && !list.Contains(rs[k]) && !SkipRenderer(rs[k])) list.Add(rs[k]);
+            }
+            return list;
+        }
+
+        class Orphan { public Renderer r; public Mesh mesh; public readonly List<Material> mats = new List<Material>(); }
+        static readonly List<Orphan> orphans = new List<Orphan>();
+
+        void HandOff(Renderer r)
+        {
+            Orphan o = new Orphan();
+            o.r = r;
+            Material[] pris;
+            pristine.TryGetValue(r, out pris);
+            Material[] sm = r.sharedMaterials;
+            for (int j = 0; j < sm.Length; j++)
+            {
+                Material m = sm[j];
+                if (m == null || o.mats.Contains(m)) continue;
+                if (created.Remove(m) || (pris != null && Array.IndexOf(pris, m) >= 0)) o.mats.Add(m);
+            }
+            if (pris != null)
+                for (int j = 0; j < pris.Length; j++)
+                    if (pris[j] != null && !o.mats.Contains(pris[j])) Destroy(pris[j]);
+            Mesh cm = MeshOf(r);
+            if (cm != null && splitMeshes.Remove(cm)) o.mesh = cm;
+            pristine.Remove(r);
+            origShared.Remove(r);
+            origMesh.Remove(r);
+            if (o.mats.Count > 0 || o.mesh != null) orphans.Add(o);
+        }
+
+        void ReleaseLeavers(bool dying)
+        {
+            if (part == null || pristine.Count == 0) return;
+            List<Renderer> keep = dying ? null : JettisonRenderers();
+            List<Renderer> gone = null;
+            foreach (KeyValuePair<Renderer, Material[]> kv in pristine)
+            {
+                Renderer r = kv.Key;
+                if (r == null || r.transform.IsChildOf(part.transform) || (keep != null && keep.Contains(r))) continue;
+                if (gone == null) gone = new List<Renderer>();
+                gone.Add(r);
+            }
+            if (gone != null)
+                for (int i = 0; i < gone.Count; i++) HandOff(gone[i]);
+        }
+
+        internal static void SweepOrphans()
+        {
+            for (int i = orphans.Count - 1; i >= 0; i--)
+            {
+                Orphan o = orphans[i];
+                if (o.r != null) continue;
+                for (int j = 0; j < o.mats.Count; j++) if (o.mats[j] != null) UnityEngine.Object.Destroy(o.mats[j]);
+                if (o.mesh != null) { ourSplitIds.Remove(o.mesh.GetInstanceID()); UnityEngine.Object.Destroy(o.mesh); }
+                orphans.RemoveAt(i);
+            }
+        }
+
         List<Renderer> OwnRenderers()
         {
             List<Renderer> mine = new List<Renderer>();
@@ -374,6 +589,8 @@ namespace ReforgedRedux
                 Part owner = all[i].GetComponentInParent<Part>();
                 if (owner == null || owner == part) mine.Add(all[i]);
             }
+            List<Renderer> jr = JettisonRenderers();
+            for (int i = 0; i < jr.Count; i++) if (!mine.Contains(jr[i])) mine.Add(jr[i]);
             return mine;
         }
 
@@ -394,13 +611,14 @@ namespace ReforgedRedux
             for (int i = 0; i < part.Modules.Count; i++) sb.Append(' ').Append(part.Modules[i].moduleName);
             sb.Append("\n");
             List<Renderer> own = OwnRenderers();
-            Renderer[] all = part.GetComponentsInChildren<Renderer>(true);
-            for (int i = 0; i < all.Length; i++)
+            List<Renderer> all = new List<Renderer>(part.GetComponentsInChildren<Renderer>(true));
+            for (int i = 0; i < own.Count; i++) if (!all.Contains(own[i])) all.Add(own[i]);
+            for (int i = 0; i < all.Count; i++)
             {
                 Renderer r = all[i];
                 if (r == null) continue;
                 Part owner = r.GetComponentInParent<Part>();
-                if (owner != null && owner != part) continue;
+                if (owner != null && owner != part && !own.Contains(r)) continue;
                 string why = SkipReason(r);
                 if (why == null && !own.Contains(r)) why = "outside the part model or IVA";
                 Mesh ms = MeshOf(r);
@@ -410,9 +628,12 @@ namespace ReforgedRedux
                   .Append(" | ").Append(why == null ? "paintable" : ("skipped: " + why));
                 if (ms != null)
                     sb.Append(" | mesh ").Append(ms.name).Append(" v=").Append(ms.vertexCount).Append(" sub=").Append(ms.subMeshCount)
-                      .Append(ms.isReadable ? " readable" : " not-readable");
-                sb.Append("\n");
+                      .Append(ms.isReadable ? " readable" : " not-readable")
+                      .Append(IsCut(ms) && !splitMeshes.Contains(ms) ? " (cut of another part)" : "");
+                else sb.Append(" | no mesh");
                 Material[] mats = r.sharedMaterials;
+                sb.Append(" | mats=").Append(mats.Length);
+                sb.Append("\n");
                 for (int j = 0; j < mats.Length; j++)
                 {
                     Material m = mats[j];
@@ -421,6 +642,7 @@ namespace ReforgedRedux
                       .Append(" q=").Append(m.renderQueue)
                       .Append(IsGlass(m) ? " transparent" : "")
                       .Append(created.Contains(m) ? " reforged" : "");
+                    if (m.HasProperty("_Opacity") && m.GetFloat("_Opacity") < 0.99f) sb.Append(" opacity=").Append(m.GetFloat("_Opacity").ToString("0.00"));
                     if (m.HasProperty(IdSpecColor)) { Color sc = m.GetColor(IdSpecColor); sb.Append(" spec=").Append(((sc.r + sc.g + sc.b) / 3f).ToString("0.00")); }
                     if (m.HasProperty(IdShininess)) sb.Append(" shine=").Append(m.GetFloat(IdShininess).ToString("0.00"));
                     if (m.HasProperty(IdMainTex))
@@ -502,7 +724,7 @@ namespace ReforgedRedux
                 if (r == null) continue;
                 Material[] os; origShared.TryGetValue(r, out os);
                 Mesh cm = MeshOf(r);
-                Material[] cur = (cm != null && ourSplitIds.Contains(cm.GetInstanceID())) ? null : r.sharedMaterials;
+                Material[] cur = IsCut(cm) ? null : r.sharedMaterials;
                 for (int j = 0; j < kv.Value.Length; j++)
                 {
                     Material pm = kv.Value[j];
@@ -528,6 +750,7 @@ namespace ReforgedRedux
         void OnDestroy()
         {
             liveModules.Remove(this);
+            try { ReleaseLeavers(true); } catch { }
             for (int i = 0; i < created.Count; i++) if (created[i] != null) Destroy(created[i]);
             created.Clear();
             FreeSplitMeshes();
@@ -537,6 +760,26 @@ namespace ReforgedRedux
         internal static bool EvenShine = true;
         internal static bool HeatTileWeight = true;
         const float TileKgPerM2 = 8f;
+
+        static int roState = -1;
+        internal static bool RealismOverhaul
+        {
+            get
+            {
+                if (roState < 0)
+                {
+                    roState = 0;
+                    try
+                    {
+                        foreach (AssemblyLoader.LoadedAssembly la in AssemblyLoader.loadedAssemblies)
+                            if (la != null && la.name == "RealismOverhaul") { roState = 1; break; }
+                    }
+                    catch { }
+                    if (roState == 1) Debug.Log("[ReforgedRedux] Realism Overhaul found, heat tile effects are off");
+                }
+                return roState == 1;
+            }
+        }
         const float StockMetal = 0f;
         const float StockSmooth = 0.45f;
         const float WinSmooth = 0.8f;
@@ -634,6 +877,20 @@ namespace ReforgedRedux
                     }
                 }
             }
+            for (int o = 0; o < orphans.Count; o++)
+            {
+                Renderer r = orphans[o].r;
+                if (r == null) continue;
+                Material[] mats = r.sharedMaterials;
+                for (int i = 0; i < mats.Length; i++)
+                {
+                    Material mat = mats[i];
+                    if (mat == null) continue;
+                    Texture a = mat.HasProperty(IdMainTex) ? mat.GetTexture(IdMainTex) : null; if (a != null) live.Add(a.GetInstanceID());
+                    Texture b = mat.HasProperty(IdBumpMap) ? mat.GetTexture(IdBumpMap) : null; if (b != null) live.Add(b.GetInstanceID());
+                    Texture g = mat.HasProperty(IdMetalGloss) ? mat.GetTexture(IdMetalGloss) : null; if (g != null) live.Add(g.GetInstanceID());
+                }
+            }
             WeatherCache.EvictExcept(live);
         }
 
@@ -697,7 +954,7 @@ namespace ReforgedRedux
             {
                 if (kv.Key == null || kv.Value == null) continue;
                 Mesh cur = MeshOf(kv.Key);
-                if (cur != null && cur != kv.Value && !ourSplitIds.Contains(cur.GetInstanceID()))
+                if (cur != null && cur != kv.Value && !IsCut(cur))
                 {
                     if (adopt == null) adopt = new List<Renderer>();
                     adopt.Add(kv.Key);
@@ -874,11 +1131,12 @@ namespace ReforgedRedux
         public void Rebuild()
         {
             if (part == null || excludedPart) return;
-
-            if (!Active) { RestoreOriginals(); return; }
+            ReleaseLeavers(false);
+            if (!Active) { RestoreOriginals(); FixDecals(); return; }
             WeatherCache.PaintDetailCur = rdxPaintDetail;
             WeatherCache.TexSkipCur = rdxTexDetail;
             RebuildInner();
+            FixDecals();
             if (WeatherCache.NeedSweep()) SweepCaches();
         }
         void RebuildInner()
@@ -900,6 +1158,7 @@ namespace ReforgedRedux
             bool geomRegion = regionMode && !pickMode;
             string bakeStack = StripPlaces(rdxStack);
             RestoreMeshesToOriginal();
+            ResetForeignMeshes(rs);
             Vector3 wdir = Vector3.up; float cw = 0f;
             Vector3 upDir = part.transform.up; float cwHeight = 0f; bool useHeight = false;
             if (geomRegion && IsPlaneTok(regionPlace))
@@ -1011,8 +1270,8 @@ namespace ReforgedRedux
                     r.materials = work;
             }
 
-            for (int i = 0; i < prev.Count; i++)
-                if (prev[i] != null) Destroy(prev[i]);
+            PadMaterials(rs);
+            ReleaseMaterials(prev);
             if (isFairing) lastRenderCount = ModelRenderCount();
         }
 
@@ -1454,6 +1713,7 @@ namespace ReforgedRedux
             zoneGeoCache.Clear();
             List<Renderer> rs = OwnRenderers();
             RestoreMeshesToOriginal();
+            ResetForeignMeshes(rs);
             List<Zone> zones = new List<Zone>(extras);
             Zone act = ActiveZone();
             if (act.HasContent) { zones.RemoveAll(delegate(Zone zz) { return zz.region == act.region; }); zones.Add(act); }
@@ -1636,7 +1896,8 @@ namespace ReforgedRedux
                     r.materials = work;
                 }
             }
-            for (int i = 0; i < prev.Count; i++) if (prev[i] != null) Destroy(prev[i]);
+            PadMaterials(rs);
+            ReleaseMaterials(prev);
             if (isFairing) lastRenderCount = ModelRenderCount();
         }
 
@@ -1897,13 +2158,10 @@ namespace ReforgedRedux
         public void UpdateHeatBuff() { UpdateHeatBuff(true); }
         void UpdateHeatBuff(bool notify)
         {
-            if (part == null || part.partInfo == null || part.partInfo.partPrefab == null) return;
-            Part pre = part.partInfo.partPrefab;
-            List<Zone> tz = AllZones().FindAll(delegate(Zone z) { return HasTiles(z.stack); });
+            if (part == null) return;
+            List<Zone> tz = RealismOverhaul ? new List<Zone>() : AllZones().FindAll(delegate(Zone z) { return HasTiles(z.stack); });
             bool heat = tz.Count > 0;
-            const double K = 2.5;
-            part.maxTemp = heat ? pre.maxTemp * K : pre.maxTemp;
-            part.skinMaxTemp = heat ? pre.skinMaxTemp * K : pre.skinMaxTemp;
+            SetHeatBuff(heat);
             float mass = 0f;
             if (heat && HeatTileWeight)
             {
@@ -1917,6 +2175,25 @@ namespace ReforgedRedux
             if (!notify) { if (!HighLogic.LoadedSceneIsEditor) { try { part.UpdateMass(); } catch { } } return; }
             if (HighLogic.LoadedSceneIsEditor) massDirty = true;
             else part.UpdateMass();
+        }
+
+        void SetHeatBuff(bool on)
+        {
+            const double K = 2.5;
+            if (on && !rdxHeatOn)
+            {
+                part.maxTemp *= K;
+                part.skinMaxTemp *= K;
+                rdxHeatMax = part.maxTemp;
+                rdxHeatSkin = part.skinMaxTemp;
+                rdxHeatOn = true;
+            }
+            else if (!on && rdxHeatOn)
+            {
+                if (Math.Abs(part.maxTemp - rdxHeatMax) < 1e-6) part.maxTemp = rdxHeatMax / K;
+                if (Math.Abs(part.skinMaxTemp - rdxHeatSkin) < 1e-6) part.skinMaxTemp = rdxHeatSkin / K;
+                rdxHeatOn = false;
+            }
         }
 
         static bool massDirty;
@@ -2289,8 +2566,18 @@ namespace ReforgedRedux
             Hint(Loc.T("#RDX_HintEvenShine", "On: painted parts get one stock-like finish, so they all match.\nOff: each part keeps its own stock shine."));
             GUILayout.Space(4f);
             Header(Loc.T("#RDX_HdrGameplay", "Gameplay"));
-            draftWeight = GUILayout.Toggle(draftWeight, Loc.T("#RDX_TileWeight", "Heat tiles add weight"));
-            Hint(Loc.T("#RDX_HintTileWeight", "Heat tiles weigh about 8 kg per square metre they cover.\nThey always raise the part's heat tolerance."));
+            if (ModuleReforged.RealismOverhaul)
+            {
+                GUI.enabled = false;
+                GUILayout.Toggle(false, Loc.T("#RDX_TileWeight", "Heat tiles add weight"));
+                GUI.enabled = true;
+                GUILayout.Label(Loc.T("#RDX_HintRO", "Realism Overhaul found: heat tiles are looks only.\nThey don't change heat tolerance or weight."), hintStyle);
+            }
+            else
+            {
+                draftWeight = GUILayout.Toggle(draftWeight, Loc.T("#RDX_TileWeight", "Heat tiles add weight"));
+                Hint(Loc.T("#RDX_HintTileWeight", "Heat tiles weigh about 8 kg per square metre they cover.\nThey always raise the part's heat tolerance."));
+            }
             GUILayout.Space(4f);
             Header(Loc.T("#RDX_HdrLoading", "Loading"));
             draftGradual = GUILayout.Toggle(draftGradual, Loc.T("#RDX_GradualLoad", "Load painted crafts gradually"));
@@ -2362,7 +2649,7 @@ namespace ReforgedRedux
         readonly List<List<UndoEntry>> redoStack = new List<List<UndoEntry>>();
         const int UndoCap = 12;
 
-        public const string Version = "1.1.0";
+        public const string Version = "1.1.1";
         static bool versionLogged;
 
         void Start()
@@ -6421,9 +6708,17 @@ namespace ReforgedRedux
             WeatherCache.ClearAllBakes();
         }
 
+        float nextDecalCheck;
+
         void Update()
         {
             ModuleReforged.FlushMassChange();
+            if (Time.realtimeSinceStartup >= nextDecalCheck)
+            {
+                nextDecalCheck = Time.realtimeSinceStartup + 0.5f;
+                ModuleReforged.FixAllDecals();
+                ModuleReforged.SweepOrphans();
+            }
             System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
             do { if (!ModuleReforged.PumpLoadQueue()) break; } while (sw.ElapsedMilliseconds < 8);
         }
